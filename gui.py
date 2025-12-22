@@ -5,384 +5,415 @@ import cv2
 import numpy as np
 import threading
 import os
+import tensorflow as tf
 
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import load_model
-    TENSORFLOW_AVAILABLE = True
-except ImportError:
-    TENSORFLOW_AVAILABLE = False
-    print("TensorFlow not installed. Install it: pip install tensorflow")
+from tensorflow.keras.models import load_model
+from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
+from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
 
-# Configuration
+# ================= CONFIG =================
+
 CELEBRITY_CLASSES = [
-    "Celebrity 1", "Celebrity 2", "Celebrity 3", "Celebrity 4", "Celebrity 5",
-    "Celebrity 6", "Celebrity 7", "Celebrity 8", "Celebrity 9", "Celebrity 10"
+    "Angelina Jolie",
+    "Brad Pitt",
+    "Jennifer Lawrence",
+    "Johnny Depp",
+    "Leonardo DiCaprio",
+    "Natalie Portman",
+    "Scarlett Johansson",
+    "Tom Cruise",
+    "Will Smith",
+    "Tom Hanks"
 ]
 
 MODEL_PATHS = {
-    "ResNet50": "resnet50_celebrity.h5",
-    "VGG16": "vgg16_model.h5",
-    "InceptionV3": "inceptionv3_model.h5"
+    "ResNet50": "resnet50_best.h5",
+    "EfficientNet": "efficientnet_best.h5",
+    "VGG16": "vgg16_model.h5"
 }
 
 IMAGE_SIZE = (224, 224)
-CONFIDENCE_THRESHOLD = 0.3
+CONF_THRESHOLD = 60  # %
 
-# Model Handler
+# ================= MODEL HANDLER =================
+
 class ModelHandler:
     def __init__(self):
         self.models = {}
         self.active_model = None
         self.active_model_name = None
 
-    def load_model(self, model_name):
-        if model_name in self.models:
-            self.active_model = self.models[model_name]
-            self.active_model_name = model_name
+    def load_model(self, name):
+        """Load a model by name, caching it for future use"""
+        if name in self.models:
+            self.active_model = self.models[name]
+            self.active_model_name = name
             return True
 
-        model_path = MODEL_PATHS.get(model_name)
-        if not model_path or not os.path.exists(model_path):
-            print(f"Model file not found: {model_path}")
+        path = MODEL_PATHS.get(name)
+        if not path or not os.path.exists(path):
             return False
 
         try:
-            if TENSORFLOW_AVAILABLE:
-                print(f"Loading {model_name}...")
-                model = load_model(model_path)
-                self.models[model_name] = model
-                self.active_model = model
-                self.active_model_name = model_name
-                print(f"{model_name} loaded successfully!")
-                return True
-            else:
-                print("TensorFlow not available")
-                return False
+            model = load_model(path)
+            self.models[name] = model
+            self.active_model = model
+            self.active_model_name = name
+            return True
         except Exception as e:
-            print(f"Error loading {model_name}: {e}")
+            print(f"Error loading model {name}: {e}")
             return False
 
     def preprocess_image(self, img):
+        """Preprocess image according to the active model's requirements"""
         if isinstance(img, Image.Image):
             img = np.array(img)
 
         img = cv2.resize(img, IMAGE_SIZE)
 
+        # Convert grayscale to RGB if needed
         if len(img.shape) == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
+        img = img.astype(np.float32)
         img = np.expand_dims(img, axis=0)
-        img = img / 255.0
+
+        # Apply model-specific preprocessing
+        if self.active_model_name == "ResNet50":
+            img = resnet_preprocess(img)
+        elif self.active_model_name == "EfficientNet":
+            img = efficientnet_preprocess(img)
+        elif self.active_model_name == "VGG16":
+            img = vgg_preprocess(img)
+
         return img
 
     def predict(self, img):
+        """Predict celebrity from image"""
         if self.active_model is None:
             return []
 
+        x = self.preprocess_image(img)
+        preds = self.active_model.predict(x, verbose=0)
+        
+        # Handle different output formats
+        if isinstance(preds, (list, tuple)):
+            preds = preds[0]
+        
+        preds = preds[0] if len(preds.shape) > 1 else preds
+
+        # Get top 3 predictions
+        top_idx = np.argsort(preds)[-3:][::-1]
+        results = []
+
+        for i in top_idx:
+            results.append({
+                "name": CELEBRITY_CLASSES[i],
+                "confidence": float(preds[i] * 100),
+                "class_idx": i
+            })
+
+        # Return "Unknown" if confidence is too low
+        if results[0]["confidence"] < CONF_THRESHOLD:
+            return [{"name": "Unknown", "confidence": results[0]["confidence"], "class_idx": None}]
+
+        return results
+
+    def generate_gradcam(self, img, class_idx):
+        """Generate Grad-CAM heatmap for the predicted class"""
+        if class_idx is None:
+            return np.array(img)
+        
+        model = self.active_model
+
+        # Find the last convolutional layer
+        last_conv_layer_name = None
+        
+        if self.active_model_name == "EfficientNet":
+            last_conv_layer_name = "top_conv"
+        elif self.active_model_name == "ResNet50":
+            last_conv_layer_name = "conv5_block3_out"
+        elif self.active_model_name == "VGG16":
+            last_conv_layer_name = "block5_conv3"
+        
+        # Fallback: find last conv layer automatically
+        if last_conv_layer_name is None or last_conv_layer_name not in [l.name for l in model.layers]:
+            for layer in reversed(model.layers):
+                if len(layer.output_shape) == 4:
+                    last_conv_layer_name = layer.name
+                    break
+        
+        if last_conv_layer_name is None:
+            print("No convolutional layer found")
+            return np.array(img)
+
         try:
-            processed_img = self.preprocess_image(img)
-            predictions = self.active_model.predict(processed_img, verbose=0)[0]
-            top_indices = np.argsort(predictions)[-3:][::-1]
+            # Create Grad-CAM model
+            grad_model = tf.keras.models.Model(
+                inputs=model.inputs,
+                outputs=[
+                    model.get_layer(last_conv_layer_name).output,
+                    model.output
+                ]
+            )
 
-            results = []
-            for idx in top_indices:
-                confidence = float(predictions[idx] * 100)
-                if confidence >= CONFIDENCE_THRESHOLD * 100:
-                    results.append({
-                        "name": CELEBRITY_CLASSES[idx],
-                        "confidence": confidence
-                    })
-            return results
-        except Exception as e:
-            print(f"Prediction error: {e}")
-            return []
+            x = self.preprocess_image(img)
 
-    def generate_gradcam(self, img):
-        try:
-            if self.active_model is None:
-                return img
+            # Compute gradient
+            with tf.GradientTape() as tape:
+                conv_outputs, predictions = grad_model(x)
+                
+                # Handle different output formats
+                if isinstance(predictions, (list, tuple)):
+                    predictions = predictions[0]
+                
+                loss = predictions[:, class_idx]
 
-            if isinstance(img, Image.Image):
-                img = np.array(img)
+            # Calculate gradients
+            grads = tape.gradient(loss, conv_outputs)
+            pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-            height, width = img.shape[:2]
-            y, x = np.ogrid[:height, :width]
-            center_y, center_x = height // 2, width // 2
+            # Generate heatmap
+            conv_outputs = conv_outputs[0]
+            heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
 
-            mask = np.exp(-((x - center_x)**2 + (y - center_y)**2) / (2 * (min(height, width) / 4)**2))
-            mask = (mask * 255).astype(np.uint8)
-            heatmap = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
+            # Normalize heatmap
+            heatmap = tf.maximum(heatmap, 0)
+            heatmap /= (tf.reduce_max(heatmap) + 1e-8)
+            heatmap = heatmap.numpy()
 
-            superimposed = cv2.addWeighted(img, 0.6, heatmap, 0.4, 0)
+            # Resize heatmap to match image size
+            heatmap = cv2.resize(heatmap, IMAGE_SIZE)
+
+            # Convert to RGB
+            img_array = cv2.resize(np.array(img), IMAGE_SIZE)
+            if len(img_array.shape) == 2:
+                img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+
+            # Apply colormap
+            heatmap = np.uint8(255 * heatmap)
+            heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+            # Superimpose heatmap on original image
+            superimposed = cv2.addWeighted(img_array, 0.6, heatmap, 0.4, 0)
             return superimposed
-        except Exception as e:
-            print(f"Grad-CAM error: {e}")
-            return img if isinstance(img, np.ndarray) else np.array(img)
 
-# GUI Application
+        except Exception as e:
+            print(f"Error generating Grad-CAM: {e}")
+            return np.array(img)
+
+
+# ================= GUI =================
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-class CelebrityRecognitionApp:
+class App:
     def __init__(self):
-        self.window = ctk.CTk()
-        self.window.title("Celebrity Face Recognition")
-        self.window.geometry("1400x800")
+        self.root = ctk.CTk()
+        self.root.geometry("1500x850")
+        self.root.title("Celebrity Face Recognition 🎬 (Grad-CAM + Real-Time)")
 
         self.model_handler = ModelHandler()
         self.current_image = None
-        self.webcam_active = False
         self.cap = None
+        self.webcam_active = False
 
-        self.setup_ui()
-        self.load_initial_model()
+        self.build_ui()
+        self.load_first_model()
 
-    def load_initial_model(self):
-        for model_name in MODEL_PATHS.keys():
-            if self.model_handler.load_model(model_name):
-                self.model_menu.set(model_name)
-                self.update_status(f"{model_name} Ready", "#16a34a")
+    def load_first_model(self):
+        """Load the first available model"""
+        for m in MODEL_PATHS:
+            if self.model_handler.load_model(m):
+                self.model_menu.set(m)
+                self.status.configure(text=f"✅ {m} Ready", text_color="#22c55e")
                 return
-        self.update_status("No models found", "#dc2626")
+        self.status.configure(text="❌ No model found", text_color="red")
 
-    def setup_ui(self):
-        main_container = ctk.CTkFrame(self.window)
-        main_container.pack(fill="both", expand=True, padx=20, pady=20)
+    def build_ui(self):
+        """Build the user interface"""
+        # Header
+        header = ctk.CTkLabel(
+            self.root, 
+            text="🎬 Celebrity Face Recognition",
+            font=ctk.CTkFont(size=30, weight="bold")
+        )
+        header.pack(pady=10)
 
-        header = ctk.CTkFrame(main_container, fg_color="transparent")
-        header.pack(fill="x", pady=(0, 20))
-
-        ctk.CTkLabel(
-            header,
-            text="Celebrity Face Recognition",
-            font=ctk.CTkFont(size=32, weight="bold")
-        ).pack(pady=10)
-
-        model_frame = ctk.CTkFrame(header)
-        model_frame.pack(pady=10)
-
-        ctk.CTkLabel(model_frame, text="Model:", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10)
+        # Top controls
+        top = ctk.CTkFrame(self.root)
+        top.pack()
 
         self.model_menu = ctk.CTkOptionMenu(
-            model_frame,
-            values=list(MODEL_PATHS.keys()),
-            command=self.change_model,
-            width=200,
-            font=ctk.CTkFont(size=14)
+            top, 
+            values=list(MODEL_PATHS.keys()), 
+            command=self.change_model, 
+            width=220
         )
         self.model_menu.pack(side="left", padx=10)
 
-        self.status_label = ctk.CTkLabel(model_frame, text="Loading...", font=ctk.CTkFont(size=14))
-        self.status_label.pack(side="left", padx=20)
+        self.status = ctk.CTkLabel(top, text="Loading...")
+        self.status.pack(side="left", padx=20)
 
-        content = ctk.CTkFrame(main_container)
-        content.pack(fill="both", expand=True, pady=10)
+        # Main body with two panels
+        body = ctk.CTkFrame(self.root)
+        body.pack(fill="both", expand=True, padx=20, pady=20)
 
-        left_panel = ctk.CTkFrame(content)
+        # Left panel: Original image
+        left_panel = ctk.CTkFrame(body)
         left_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-
-        ctk.CTkLabel(left_panel, text="Image / Video", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=10)
-
-        self.image_frame = ctk.CTkFrame(left_panel, fg_color="gray20")
-        self.image_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.image_label = ctk.CTkLabel(self.image_frame, text="Upload image or start webcam", font=ctk.CTkFont(size=16))
+        
+        ctk.CTkLabel(
+            left_panel, 
+            text="Original Image", 
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=5)
+        
+        self.image_label = ctk.CTkLabel(left_panel, text="")
         self.image_label.pack(fill="both", expand=True)
 
-        right_panel = ctk.CTkFrame(content, width=400)
-        right_panel.pack(side="right", fill="both", padx=(10, 0))
-        right_panel.pack_propagate(False)
-
-        ctk.CTkLabel(right_panel, text="Top-3 Predictions", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=15)
-
-        self.predictions_frame = ctk.CTkScrollableFrame(right_panel, height=250)
-        self.predictions_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(right_panel, text="Grad-CAM", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=15)
-
-        self.gradcam_frame = ctk.CTkFrame(right_panel, fg_color="gray20", height=300)
-        self.gradcam_frame.pack(fill="x", padx=15, pady=5)
-        self.gradcam_frame.pack_propagate(False)
-
-        self.gradcam_label = ctk.CTkLabel(self.gradcam_frame, text="Waiting for prediction...")
+        # Right panel: Grad-CAM + Results
+        right_panel = ctk.CTkFrame(body)
+        right_panel.pack(side="right", fill="both", expand=True, padx=(10, 0))
+        
+        ctk.CTkLabel(
+            right_panel, 
+            text="Grad-CAM Visualization", 
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=5)
+        
+        self.gradcam_label = ctk.CTkLabel(right_panel, text="")
         self.gradcam_label.pack(fill="both", expand=True)
+        
+        # Results display
+        self.results_label = ctk.CTkLabel(
+            right_panel,
+            text="",
+            font=ctk.CTkFont(size=14),
+            justify="left"
+        )
+        self.results_label.pack(pady=10)
 
-        buttons = ctk.CTkFrame(main_container, fg_color="transparent")
-        buttons.pack(fill="x", pady=10)
+        # Bottom buttons
+        bottom = ctk.CTkFrame(self.root)
+        bottom.pack(pady=10)
 
         ctk.CTkButton(
-            buttons, text="Upload Image", command=self.upload_image,
-            width=220, height=50, font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#2563eb", hover_color="#1e40af"
+            bottom, 
+            text="📁 Upload Image",
+            command=self.upload_image, 
+            width=200,
+            height=40,
+            font=ctk.CTkFont(size=14)
         ).pack(side="left", padx=5)
 
         self.webcam_btn = ctk.CTkButton(
-            buttons, text="Start Webcam", command=self.toggle_webcam,
-            width=220, height=50, font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#16a34a", hover_color="#15803d"
+            bottom, 
+            text="📹 Start Webcam",
+            command=self.toggle_webcam, 
+            width=200,
+            height=40,
+            font=ctk.CTkFont(size=14)
         )
         self.webcam_btn.pack(side="left", padx=5)
 
-        self.snapshot_btn = ctk.CTkButton(
-            buttons, text="Snapshot", command=self.take_snapshot,
-            width=220, height=50, font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#eab308", state="disabled"
-        )
-        self.snapshot_btn.pack(side="left", padx=5)
-
-    def update_status(self, text, color):
-        self.status_label.configure(text=text, text_color=color)
-
-    def change_model(self, model_name):
-        self.update_status(f"Loading {model_name}...", "#eab308")
-        if self.model_handler.load_model(model_name):
-            self.update_status(f"{model_name} Ready", "#16a34a")
+    def change_model(self, name):
+        """Change the active model"""
+        self.status.configure(text=f"Loading {name}...", text_color="yellow")
+        if self.model_handler.load_model(name):
+            self.status.configure(text=f"✅ {name} Ready", text_color="#22c55e")
+            # Reprocess current image if available
             if self.current_image:
-                self.process_image(self.current_image)
+                self.process_frame(self.current_image)
         else:
-            self.update_status(f"Failed to load {model_name}", "#dc2626")
+            self.status.configure(text=f"❌ {name} not found", text_color="red")
 
     def upload_image(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.gif")])
-        if file_path:
-            if self.webcam_active:
-                self.toggle_webcam()
-            try:
-                img = Image.open(file_path)
-                self.current_image = img
-                self.display_image(img)
-                self.process_image(img)
-            except Exception as e:
-                self.update_status(f"Error: {e}", "#dc2626")
+        """Upload and process an image"""
+        path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.jpg *.png *.jpeg *.bmp *.gif")]
+        )
+        if path:
+            img = Image.open(path).convert('RGB')
+            self.current_image = img
+            self.process_frame(img)
 
-    def display_image(self, img):
-        display_img = img.copy()
-        display_img.thumbnail((600, 600))
-        photo = ImageTk.PhotoImage(display_img)
-        self.image_label.configure(image=photo, text="")
-        self.image_label.image = photo
+    def show_image(self, label, img):
+        """Display an image in a label"""
+        if isinstance(img, np.ndarray):
+            img = Image.fromarray(img)
+        
+        img = img.copy()
+        img.thumbnail((650, 650))
+        photo = ImageTk.PhotoImage(img)
+        label.configure(image=photo, text="")
+        label.image = photo
 
-    def process_image(self, img):
-        self.update_status("Processing...", "#eab308")
-        predictions = self.model_handler.predict(img)
-        self.display_predictions(predictions)
-        img_array = np.array(img)
-        gradcam = self.model_handler.generate_gradcam(img_array)
-        self.display_gradcam(gradcam)
-        self.update_status("Done", "#16a34a")
-
-    def display_predictions(self, predictions):
-        for widget in self.predictions_frame.winfo_children():
-            widget.destroy()
-
-        if not predictions:
-            ctk.CTkLabel(self.predictions_frame, text="No predictions", font=ctk.CTkFont(size=14)).pack(pady=20)
+    def process_frame(self, img):
+        """Process a frame and display results"""
+        # Get predictions
+        preds = self.model_handler.predict(img)
+        
+        if not preds:
+            self.results_label.configure(text="No predictions available")
             return
 
-        for i, pred in enumerate(predictions[:3], 1):
-            pred_frame = ctk.CTkFrame(self.predictions_frame)
-            pred_frame.pack(fill="x", pady=8, padx=5)
+        # Display original image
+        self.show_image(self.image_label, img)
 
-            top_row = ctk.CTkFrame(pred_frame, fg_color="transparent")
-            top_row.pack(fill="x", padx=10, pady=(10, 5))
+        # Generate and display Grad-CAM if prediction is confident
+        if preds[0]["name"] != "Unknown" and preds[0].get("class_idx") is not None:
+            cam = self.model_handler.generate_gradcam(img, preds[0]["class_idx"])
+            self.show_image(self.gradcam_label, cam)
+        else:
+            # Show original image if prediction is unknown
+            self.show_image(self.gradcam_label, img)
 
-            rank_colors = {1: "#FFD700", 2: "#C0C0C0", 3: "#CD7F32"}
-            ctk.CTkLabel(
-                top_row, text=f"#{i}", font=ctk.CTkFont(size=22, weight="bold"),
-                width=50, fg_color=rank_colors.get(i, "gray40"), corner_radius=8
-            ).pack(side="left", padx=(0, 10))
-
-            ctk.CTkLabel(
-                top_row, text=pred['name'], font=ctk.CTkFont(size=16, weight="bold"), anchor="w"
-            ).pack(side="left", fill="x", expand=True)
-
-            conf = pred['confidence']
-            ctk.CTkLabel(
-                top_row, text=f"{conf:.1f}%", font=ctk.CTkFont(size=16, weight="bold"),
-                text_color="#16a34a" if conf > 70 else "#eab308"
-            ).pack(side="right", padx=10)
-
-            progress_frame = ctk.CTkFrame(pred_frame, fg_color="transparent")
-            progress_frame.pack(fill="x", padx=10, pady=(0, 10))
-            progress = ctk.CTkProgressBar(progress_frame, height=12)
-            progress.pack(fill="x")
-            progress.set(conf / 100)
-
-    def display_gradcam(self, gradcam_img):
-        if isinstance(gradcam_img, np.ndarray):
-            gradcam_img = Image.fromarray(gradcam_img)
-        gradcam_img.thumbnail((350, 350))
-        photo = ImageTk.PhotoImage(gradcam_img)
-        self.gradcam_label.configure(image=photo, text="")
-        self.gradcam_label.image = photo
+        # Display results text
+        results_text = "Predictions:\n\n"
+        for i, p in enumerate(preds, 1):
+            results_text += f"#{i} {p['name']}\n"
+            results_text += f"   Confidence: {p['confidence']:.1f}%\n\n"
+        
+        self.results_label.configure(text=results_text)
 
     def toggle_webcam(self):
+        """Toggle webcam on/off"""
         if not self.webcam_active:
-            self.start_webcam()
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                self.status.configure(text="❌ Cannot open webcam", text_color="red")
+                return
+            
+            self.webcam_active = True
+            self.webcam_btn.configure(text="⏹ Stop Webcam", fg_color="red")
+            threading.Thread(target=self.webcam_loop, daemon=True).start()
         else:
-            self.stop_webcam()
-
-    def start_webcam(self):
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            self.update_status("Camera not available", "#dc2626")
-            return
-
-        self.webcam_active = True
-        self.webcam_btn.configure(text="Stop Webcam", fg_color="#dc2626")
-        self.snapshot_btn.configure(state="normal")
-        threading.Thread(target=self.webcam_loop, daemon=True).start()
-
-    def stop_webcam(self):
-        self.webcam_active = False
-        if self.cap:
-            self.cap.release()
-        self.webcam_btn.configure(text="Start Webcam", fg_color="#16a34a")
-        self.snapshot_btn.configure(state="disabled")
+            self.webcam_active = False
+            if self.cap:
+                self.cap.release()
+            self.webcam_btn.configure(text="📹 Start Webcam", fg_color=["#3B8ED0", "#1F6AA5"])
 
     def webcam_loop(self):
-        frame_count = 0
+        """Process webcam frames in real-time"""
         while self.webcam_active:
             ret, frame = self.cap.read()
             if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_img = Image.fromarray(frame_rgb)
-                self.display_image(frame_img)
-
-                frame_count += 1
-                if frame_count % 15 == 0:
-                    self.process_image(frame_img)
-
-            cv2.waitKey(33)
-
-    def take_snapshot(self):
-        if self.webcam_active and self.cap:
-            ret, frame = self.cap.read()
-            if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                self.current_image = Image.fromarray(frame_rgb)
-                self.stop_webcam()
-                self.process_image(self.current_image)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame)
+                self.process_frame(img)
+            else:
+                break
 
     def run(self):
-        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.window.mainloop()
+        """Start the application"""
+        self.root.mainloop()
 
-    def on_closing(self):
-        if self.webcam_active:
-            self.stop_webcam()
-        self.window.destroy()
 
-# Run Application
+# ================= RUN =================
+
 if __name__ == "__main__":
-    print("Celebrity Face Recognition System")
-    print(f"Classes: {len(CELEBRITY_CLASSES)}")
-    print(f"Models: {', '.join(MODEL_PATHS.keys())}")
-    print("\nChecking model files...")
-    for name, path in MODEL_PATHS.items():
-        print(f"  {name}: {'Found' if os.path.exists(path) else 'NOT FOUND'}")
-    print("\nStarting application...\n")
-
-    app = CelebrityRecognitionApp()
+    app = App()
     app.run()
