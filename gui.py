@@ -66,28 +66,32 @@ class ModelHandler:
             return False
 
     def preprocess_image(self, img):
-        """Preprocess image according to the active model's requirements"""
-        if isinstance(img, Image.Image):
-            img = np.array(img)
-
-        img = cv2.resize(img, IMAGE_SIZE)
-
-        # Convert grayscale to RGB if needed
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-
-        img = img.astype(np.float32)
-        img = np.expand_dims(img, axis=0)
-
-        # Apply model-specific preprocessing
-        if self.active_model_name == "ResNet50":
-            img = resnet_preprocess(img)
-        elif self.active_model_name == "EfficientNet":
-            img = efficientnet_preprocess(img)
-        elif self.active_model_name == "VGG16":
-            img = vgg_preprocess(img)
-
-        return img
+         """Preprocess image according to the active model's requirements"""
+         if isinstance(img, Image.Image):
+             img = np.array(img)
+     
+         img = cv2.resize(img, IMAGE_SIZE)
+     
+         # Convert grayscale to RGB if needed
+         if len(img.shape) == 2:
+             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+     
+         img = img.astype(np.float32)
+         img = np.expand_dims(img, axis=0)
+     
+         # Apply model-specific preprocessing
+         if self.active_model_name == "ResNet50":
+             img = resnet_preprocess(img)
+         elif self.active_model_name == "EfficientNet":
+             # Raw [0-255] - no preprocessing needed
+             pass
+         elif self.active_model_name == "VGG16":
+             # Convert to BGR and apply VGG preprocessing
+             img_bgr = cv2.cvtColor(img[0], cv2.COLOR_RGB2BGR)
+             img = np.expand_dims(img_bgr, axis=0).astype(np.float32)
+             img = vgg_preprocess(img)
+     
+         return img
 
     def predict(self, img):
         """Predict celebrity from image"""
